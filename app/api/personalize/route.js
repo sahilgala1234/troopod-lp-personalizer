@@ -3,6 +3,59 @@ import { GoogleGenAI } from '@google/genai';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
+// Model cascade: try in order until one works
+// gemini-1.5-flash has the most generous free-tier quota (RPM/RPD)
+const MODEL_CASCADE = [
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-8b',
+  'gemini-1.5-pro',
+];
+
+// ── Retry helper ───────────────────────────────────────────────────────────
+
+async function generateWithRetry(params, maxRetries = 2) {
+  let lastError;
+
+  for (const model of MODEL_CASCADE) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          ...params,
+          model,
+        });
+        return response; // success
+      } catch (err) {
+        lastError = err;
+        const msg = err?.message || '';
+        const is429 = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+
+        if (is429) {
+          // Extract retry delay from error if available (e.g. "retry in 24.99s")
+          const retryMatch = msg.match(/retry[^\d]*(\d+(?:\.\d+)?)\s*s/i);
+          const waitMs = retryMatch ? Math.min(parseFloat(retryMatch[1]) * 1000, 8000) : 3000;
+
+          if (attempt < maxRetries) {
+            console.warn(`[personalize] 429 on ${model}, waiting ${waitMs}ms before retry ${attempt + 1}…`);
+            await new Promise((r) => setTimeout(r, waitMs));
+          } else {
+            console.warn(`[personalize] 429 quota exhausted on ${model}, trying next model…`);
+            break; // try next model
+          }
+        } else {
+          // Non-quota error — throw immediately
+          throw err;
+        }
+      }
+    }
+  }
+
+  // All models exhausted
+  throw new Error(
+    'QUOTA_EXHAUSTED: All Gemini models have reached their free-tier quota limit. ' +
+    'Please enable billing at https://aistudio.google.com or wait a few minutes and try again.'
+  );
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 async function fetchLandingPage(url) {
@@ -28,29 +81,16 @@ async function fetchLandingPage(url) {
 }
 
 function htmlToText(html) {
-  // Very light HTML stripping — preserves text content for LLM context
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim()
-    .slice(0, 6000); // cap for token budget
-}
-
-function extractBodyContent(html) {
-  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  return bodyMatch ? bodyMatch[1] : html;
+    .slice(0, 5000); // tighter cap → fewer tokens → more quota-friendly
 }
 
 function injectPersonalization(originalHtml, changes) {
-  /**
-   * Strategy:
-   * 1. We do targeted text replacements based on Gemini's change plan.
-   * 2. We also inject a personalization banner above the fold.
-   * 3. We patch <title> if needed.
-   * All changes are conservative — we never remove DOM structure.
-   */
   let html = originalHtml;
 
   // Patch page title
@@ -61,7 +101,7 @@ function injectPersonalization(originalHtml, changes) {
     );
   }
 
-  // Inject personalization banner (above the fold, before </body>)
+  // Inject personalization banner
   const bannerHtml = `
 <div id="tp-personalizer-banner" style="
   position: fixed; bottom: 20px; right: 20px; z-index: 99999;
@@ -84,15 +124,13 @@ function injectPersonalization(originalHtml, changes) {
 `;
   html = html.replace(/<\/body>/i, `${bannerHtml}</body>`);
 
-  // Apply text replacements
+  // Apply text replacements (safe — no-op if text not found)
   if (changes.replacements && Array.isArray(changes.replacements)) {
     for (const { original, replacement } of changes.replacements) {
       if (!original || !replacement) continue;
-      // Escape special regex chars in the original string
       const escaped = original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       try {
-        const re = new RegExp(escaped, 'g');
-        html = html.replace(re, replacement);
+        html = html.replace(new RegExp(escaped, 'g'), replacement);
       } catch (_) {
         // Skip invalid patterns silently
       }
@@ -103,7 +141,6 @@ function injectPersonalization(originalHtml, changes) {
 }
 
 function validateHtml(html) {
-  // Basic sanity: must have html/body tags, must be substantial
   if (!html || html.length < 200) return false;
   const lower = html.toLowerCase();
   return lower.includes('<html') || lower.includes('<body') || lower.includes('<!doctype');
@@ -129,7 +166,7 @@ export async function POST(request) {
     const originalHtml = await fetchLandingPage(lpUrl);
     const lpText = htmlToText(originalHtml);
 
-    // ── Step 2: Prepare ad image for Gemini ───────────────────────────
+    // ── Step 2: Prepare ad image ───────────────────────────────────────
     let imagePart;
     if (adImageFile && typeof adImageFile === 'object' && adImageFile.size > 0) {
       const bytes = await adImageFile.arrayBuffer();
@@ -141,7 +178,6 @@ export async function POST(request) {
         },
       };
     } else if (adImageUrl) {
-      // Fetch image from URL and convert to base64
       const imgRes = await fetch(adImageUrl, {
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TroopodBot/1.0)' },
       });
@@ -156,10 +192,10 @@ export async function POST(request) {
       };
     }
 
-    // ── Step 3: Gemini — Analyze ad creative ──────────────────────────
+    // ── Step 3: Analyze ad creative (with retry + model cascade) ──────
     const analysisPrompt = `You are an expert performance marketer and CRO specialist.
 
-Analyze this ad creative image and extract the following in JSON format (respond ONLY with valid JSON, no markdown):
+Analyze this ad creative image and extract the following in JSON format (respond ONLY with valid JSON, no markdown fences):
 
 {
   "offer": "The specific product, service, or value proposition being advertised",
@@ -172,15 +208,11 @@ Analyze this ad creative image and extract the following in JSON format (respond
   "urgency": "Any urgency or scarcity element present (or null if none)"
 }`;
 
-    const analysisResponse = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+    const analysisResponse = await generateWithRetry({
       contents: [
         {
           role: 'user',
-          parts: [
-            imagePart,
-            { text: analysisPrompt },
-          ],
+          parts: [imagePart, { text: analysisPrompt }],
         },
       ],
     });
@@ -190,8 +222,8 @@ Analyze this ad creative image and extract the following in JSON format (respond
       const rawText = analysisResponse.candidates[0].content.parts[0].text;
       const cleaned = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       adAnalysis = JSON.parse(cleaned);
-    } catch (parseErr) {
-      // Fallback: extract what we can
+    } catch (_) {
+      // Graceful fallback so the pipeline continues
       adAnalysis = {
         offer: 'Premium product/service',
         headline: 'Transform your results',
@@ -204,7 +236,7 @@ Analyze this ad creative image and extract the following in JSON format (respond
       };
     }
 
-    // ── Step 4: Gemini — Generate personalization plan ────────────────
+    // ── Step 4: Generate personalization plan (text-only — cheaper) ───
     const personalizationPrompt = `You are an elite CRO (Conversion Rate Optimization) specialist.
 
 AD CREATIVE ANALYSIS:
@@ -217,13 +249,13 @@ TASK: Create a personalization plan to align this landing page with the ad creat
 The goal is message match — users clicking the ad should see a page that feels like a natural continuation.
 
 Apply these CRO principles:
-1. **Message Match**: Hero headline must echo the ad's key message
-2. **Above-the-fold CTA**: Ensure the primary CTA matches the ad's CTA
-3. **Benefit-first copy**: Lead with the #1 benefit from the ad
-4. **Urgency alignment**: If the ad has urgency, reflect it on the page
-5. **Audience language**: Use words/phrases resonant with the target audience
+1. Message Match: Hero headline must echo the ad's key message
+2. Above-the-fold CTA: Primary CTA matches the ad's CTA
+3. Benefit-first copy: Lead with the #1 benefit from the ad
+4. Urgency alignment: If the ad has urgency, reflect it on the page
+5. Audience language: Use vocabulary resonant with the target audience
 
-Respond ONLY with this exact JSON structure (no markdown code fences):
+Respond ONLY with valid JSON (no markdown fences, no extra text):
 {
   "pageTitle": "New SEO-optimized page title aligned to the ad",
   "adInsights": {
@@ -241,17 +273,15 @@ Respond ONLY with this exact JSON structure (no markdown code fences):
   ],
   "replacements": [
     {
-      "original": "exact text to find in the HTML (be specific, at least 5 chars)",
+      "original": "exact text to find in the HTML (must appear verbatim, at least 5 chars)",
       "replacement": "new personalized text to replace it with"
     }
   ]
 }
 
-Generate 5-10 targeted text replacements. Each 'original' field must be exact text that appears in the landing page.
-Focus on: h1, h2, primary CTA buttons, hero subheadlines, nav CTAs, and above-the-fold copy.`;
+Generate 5-8 targeted text replacements. Focus on: h1, h2, primary CTA buttons, hero subheadlines, nav CTAs.`;
 
-    const personalizationResponse = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+    const personalizationResponse = await generateWithRetry({
       contents: [
         {
           role: 'user',
@@ -265,22 +295,20 @@ Focus on: h1, h2, primary CTA buttons, hero subheadlines, nav CTAs, and above-th
       const rawText = personalizationResponse.candidates[0].content.parts[0].text;
       const cleaned = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       personalizationPlan = JSON.parse(cleaned);
-    } catch (parseErr) {
-      throw new Error('AI returned invalid personalization plan. Please try again.');
+    } catch (_) {
+      throw new Error('AI returned an invalid response. Please try again.');
     }
 
-    // ── Step 5: Apply changes to HTML ────────────────────────────────
+    // ── Step 5: Apply + validate ──────────────────────────────────────
     const personalizedHtml = injectPersonalization(originalHtml, {
       pageTitle: personalizationPlan.pageTitle,
       replacements: personalizationPlan.replacements || [],
     });
 
-    // ── Step 6: Validate output ───────────────────────────────────────
     if (!validateHtml(personalizedHtml)) {
       throw new Error('Generated page failed validation. The source page may not be accessible.');
     }
 
-    // ── Return result ─────────────────────────────────────────────────
     return NextResponse.json({
       success: true,
       originalUrl: lpUrl,
@@ -292,8 +320,21 @@ Focus on: h1, h2, primary CTA buttons, hero subheadlines, nav CTAs, and above-th
     });
   } catch (err) {
     console.error('[personalize] error:', err);
+
+    // User-friendly quota error message
+    const msg = err?.message || '';
+    if (msg.startsWith('QUOTA_EXHAUSTED') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')) {
+      return NextResponse.json(
+        {
+          error:
+            'The Gemini API free-tier quota is exhausted. Please enable billing at https://aistudio.google.com/apikey and try again, or wait a few minutes for the rate limit to reset.',
+        },
+        { status: 429 }
+      );
+    }
+
     return NextResponse.json(
-      { error: err.message || 'Something went wrong. Please try again.' },
+      { error: msg || 'Something went wrong. Please try again.' },
       { status: 500 }
     );
   }
